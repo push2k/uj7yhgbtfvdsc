@@ -1,0 +1,452 @@
+#include "Ldr.h"
+
+#include "pecnv.h"
+
+#include <knownfolders.h>
+#include <fstream>
+#include "xorstr.h"
+
+
+#ifdef _WIN64
+#define RET_INSTRUCTION 0xC3
+#else
+#define RET_INSTRUCTION 0xC2
+#endif
+
+using namespace caps_hook;
+
+loader::LdrData loader::gLoaderData{};
+
+bool loader::hookPe(BYTE* Image, size_t ImageSize, LPCWSTR dllName) {
+	if (!Image || !ImageSize) {
+#ifdef _DEBUG
+		cerr << " " << endl;
+#endif
+		return false;
+	}
+	if (!loadImageToSection(Image, ImageSize)) {
+#ifdef _DEBUG
+		cerr << " " << endl;
+#endif
+		return false;
+	}
+	gLoaderData.state = LdrState::NtOpenSection;
+	PVOID hVeh = AddVectoredExceptionHandler(1, &vehHandler);
+	if (!hVeh) {
+#ifdef _DEBUG
+		cerr << " " << endl;
+#endif
+		return false;
+	}
+	setupBreakpointVeh(reinterpret_cast<uintptr_t>(&NtOpenSection));
+	HMODULE hModule = LoadLibraryW(dllName);
+	RemoveVectoredExceptionHandler(hVeh);
+	if (!hModule) {
+#ifdef _DEBUG
+		cerr << " " << endl;
+		cerr << " " << GetLastError() << endl;
+#endif
+		return false;
+	}
+#ifdef _DEBUG
+	cout << " " << std::hex << hModule << endl;
+	cout << " " << std::hex << gLoaderData.DllBase << endl;
+#endif
+	uintptr_t ep_va = reinterpret_cast<uintptr_t>(hModule) + gLoaderData.ep;
+#ifdef _DEBUG
+	cout << " " << std::hex << ep_va << endl;
+#endif
+	int ret = 0;
+	if (peconv::is_dot_net(Image, ImageSize)) {
+		cerr << " " << endl;
+		return false;
+	}
+	try {
+		using Main_F = int(*__cdecl)(void);
+		if (!gLoaderData.is_dll) {
+			ret = reinterpret_cast<Main_F>(ep_va)();
+		}
+	}
+	catch (...) {
+#ifdef _DEBUG
+		cerr << " " << endl;
+#endif
+	}
+#ifdef _DEBUG
+	cout << " " << ret << endl;
+#endif
+	return true;
+}
+
+bool loader::run(BYTE* Image, size_t ImageSize) {
+	const auto dllName = xorstr_w(TARGET_DLL);       // wchar_t
+	const auto dir = xorstr_w(L"\\KnownDlls");   // wchar_t
+	const auto dir32 = xorstr_w(L"\\KnownDlls32"); // wchar_t
+
+	std::ignore = RtlCreateUnicodeString(&gLoaderData.DllName, dllName);
+	std::ignore = RtlCreateUnicodeString(&gLoaderData.Directory, dir);
+	std::ignore = RtlCreateUnicodeString(&gLoaderData.Directory32, dir32);
+
+	return hookPe(Image, ImageSize, dllName);
+}
+
+
+bool loader::loadImageToSection(BYTE* Image, size_t ImageSize) {
+#ifdef _WIN64
+	PIMAGE_NT_HEADERS64 nt = peconv::get_nt_hdrs64(Image);
+#else
+	PIMAGE_NT_HEADERS32 nt = peconv::get_nt_hdrs32(Image);
+#endif
+	if (!nt) {
+#ifdef _DEBUG
+		cout << " " << endl;
+#endif
+		return false;
+	}
+	gLoaderData.ep = nt->OptionalHeader.AddressOfEntryPoint;
+	if (!(nt->FileHeader.Characteristics & IMAGE_FILE_DLL)) {// check if dll
+		gLoaderData.is_dll = FALSE;
+		nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+		RtlSecureZeroMemory(&nt->OptionalHeader.AddressOfEntryPoint, sizeof DWORD);
+	}
+	else {
+		gLoaderData.is_dll = TRUE;
+	}
+	const Path fakeFile = files::getSystem32Path() / TARGET_FILE;
+
+	bool hasReloc = peconv::has_relocations(Image);
+	PVOID mapAddress = nullptr;
+	if (!hasReloc) 
+		mapAddress = reinterpret_cast<PVOID>(peconv::get_image_base(Image));
+
+	AutoHandle hFile = CreateFileW(fakeFile.c_str(),
+		GENERIC_READ,
+		0,
+		nullptr,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr
+	);
+	if (!hFile) {
+#ifdef _DEBUG
+		cerr << " " << endl;
+#endif
+		return false;
+	}
+	AutoNtHandle hSection = nullptr;
+	NTSTATUS status = NtCreateSection(&hSection,
+		SECTION_ALL_ACCESS,
+		nullptr,
+		0,
+		PAGE_READONLY,
+		SEC_IMAGE,
+		hFile.get()
+	);
+	if (!NT_SUCCESS(status)) {
+#ifdef _DEBUG
+		cerr << " " << std::hex << status << endl;
+#endif
+		return false;
+	}
+	SIZE_T imageSize = 0;
+	status = NtMapViewOfSection(
+		hSection.get(),
+		NtCurrentProcess(),
+		&mapAddress,
+		0,
+		0,
+		nullptr,
+		&imageSize,
+		ViewShare,
+		0,
+		PAGE_READWRITE
+		);
+#ifdef _DEBUG
+	cout << " " << std::hex << status << endl;
+#endif
+	if (!NT_SUCCESS(status)) {
+#ifdef _DEBUG
+		cerr << " " << std::hex << status << endl;
+#endif
+		return false;
+	}
+	hFile.reset();
+#ifdef _DEBUG
+	cout << " " << std::hex << mapAddress << endl;
+#endif
+	DWORD oldProtect = 0;
+	size_t prev_size = peconv::get_image_size(reinterpret_cast<BYTE*>(mapAddress));
+#ifdef _DEBUG
+	cout << " " << std::dec << prev_size << endl;
+#endif
+	if (!prev_size) {
+#ifdef _DEBUG
+		cerr << " " << endl;
+#endif
+		return false;
+	}
+	if (nt->OptionalHeader.SizeOfImage > static_cast<DWORD>(prev_size)) {
+#ifdef _DEBUG
+		cerr << " " << endl;
+#endif
+		return false;
+	}
+	if (!VirtualProtect(mapAddress, prev_size, PAGE_READWRITE, &oldProtect)) {
+#ifdef _DEBUG
+		cerr << " " << std::dec << GetLastError() << endl;
+#endif
+		return false;
+	}
+
+	RtlSecureZeroMemory(mapAddress, prev_size);
+	if (!peconv::sections_raw_to_virtual(Image, ImageSize, reinterpret_cast<BYTE*>(mapAddress), imageSize)) {
+#ifdef _DEBUG
+		cerr << " " << endl;
+#endif
+		return false;
+	}
+	if (hasReloc) {
+		peconv::relocate_module(
+			reinterpret_cast<BYTE*>(mapAddress), imageSize,
+			reinterpret_cast<ULONGLONG>(mapAddress)
+		);
+	}
+	gLoaderData.hSection = hSection.release();
+	gLoaderData.DllBase = mapAddress;
+	gLoaderData.SizeOfImage = nt->OptionalHeader.SizeOfImage;
+	peconv::set_sections_access(mapAddress, (PBYTE)mapAddress, gLoaderData.SizeOfImage);
+	return true;
+}
+
+Path files::getKnownPath(REFKNOWNFOLDERID rfid) {
+	Path path;
+	PWSTR temp;
+	const HRESULT hResukt = SHGetKnownFolderPath(rfid, 0, nullptr, &temp);
+	if (hResukt == S_OK) {
+		path = temp;
+	}
+	if (temp)
+		CoTaskMemFree(temp);
+	return path;
+}
+
+Path files::getSystem32Path() { return files::getKnownPath(FOLDERID_System); }
+Path files::getSysWow64Path() { return files::getKnownPath(FOLDERID_SystemX86); }
+
+bool loader::setupBreakpointVeh(uintptr_t address, PCONTEXT ctx) {
+	if (!ctx) {
+		ctx = (PCONTEXT)RtlAllocateHeap(NtCurrentTeb()->ProcessEnvironmentBlock->ProcessHeap, 0, sizeof(CONTEXT));
+		if (!ctx) return false;
+		ctx->ContextFlags = CONTEXT_DEBUG_REGISTERS;
+		NtGetContextThread(NtCurrentThread(), ctx);
+		ctx->Dr7 = static_cast<SIZE_T>(1 << 0);
+		ctx->Dr0 = address;
+		NtContinue(ctx, FALSE);
+		RtlFreeHeap(NtCurrentTeb()->ProcessEnvironmentBlock->ProcessHeap, 0, ctx);
+	}
+	else {
+		ctx->Dr7 = static_cast<SIZE_T>(1 << 0);
+		ctx->Dr0 = address;
+		NtContinue(ctx, FALSE);
+	}
+	return true;
+}
+
+LONG NTAPI loader::vehHandler(PEXCEPTION_POINTERS ExceptionInfo) {
+	if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP) { //HWBP
+		if (gLoaderData.state == LdrState::NtOpenSection) {
+#ifdef _DEBUG
+			cout << " " << endl;
+#endif
+			WCHAR              nameBuffer[MAX_PATH * 2]{};
+			UNICODE_STRING     objectName{};
+			RtlSecureZeroMemory(&objectName, sizeof objectName);
+			ULONG              returnLength = 0;
+#ifdef _WIN64
+			POBJECT_ATTRIBUTES objectAttr = reinterpret_cast<POBJECT_ATTRIBUTES>(ExceptionInfo->ContextRecord->R8);
+#else
+			POBJECT_ATTRIBUTES objectAttr = *reinterpret_cast<POBJECT_ATTRIBUTES*>(ExceptionInfo->ContextRecord->Esp + 3 * 4);
+#endif
+			PUNICODE_STRING tempName = objectAttr->ObjectName;
+			if (RtlCompareUnicodeString(tempName, &gLoaderData.DllName, TRUE))
+				NtContinue(ExceptionInfo->ContextRecord, FALSE);
+			objectName.Buffer = nameBuffer;
+			objectName.Length = MAX_PATH * 2;
+			objectName.MaximumLength = MAX_PATH * 2;
+			if (NtQueryObject(objectAttr->RootDirectory, ObjectNameInformation, &objectName, MAX_PATH * 2 + sizeof(UNICODE_STRING), NULL) != 0x00) {
+				NtContinue(ExceptionInfo->ContextRecord, FALSE);
+			}
+			if (RtlCompareUnicodeString(&objectName, &gLoaderData.Directory, TRUE)) {
+				if (RtlCompareUnicodeString(&objectName, &gLoaderData.Directory32, TRUE)) {
+					NtContinue(ExceptionInfo->ContextRecord, FALSE);
+				}
+			}
+#ifdef _WIN64
+			auto hSection = reinterpret_cast<PHANDLE>(ExceptionInfo->ContextRecord->Rcx);
+#else
+			auto hSection = *reinterpret_cast<PHANDLE*>(ExceptionInfo->ContextRecord->Esp + 4);
+#endif
+			*hSection = gLoaderData.hSection;
+#ifdef _DEBUG
+			cout << " " << endl;
+#endif
+
+			size_t ret = 0;
+#ifdef _WIN64
+			PBYTE func_base = reinterpret_cast<PBYTE>(ExceptionInfo->ContextRecord->Rip);
+#else
+			PBYTE func_base = reinterpret_cast<PBYTE>(ExceptionInfo->ContextRecord->Eip);
+#endif
+			while (*func_base != RET_INSTRUCTION) {
+				func_base++;
+				ret++;
+			} 
+#ifdef _WIN64
+			ExceptionInfo->ContextRecord->Rax = 0;
+			ExceptionInfo->ContextRecord->Rip += ret;
+#else
+			ExceptionInfo->ContextRecord->Eax = 0;
+			ExceptionInfo->ContextRecord->Eip += ret;
+#endif
+
+			gLoaderData.state = LdrState::NtMapViewOfSection;
+			setupBreakpointVeh(reinterpret_cast<uintptr_t>(&NtMapViewOfSection), ExceptionInfo->ContextRecord);
+
+			NtContinue(ExceptionInfo->ContextRecord, FALSE);
+		}
+		if (gLoaderData.state == LdrState::NtMapViewOfSection) {
+#ifdef _DEBUG
+			cout << " " << endl;
+#endif
+#ifdef _WIN64
+			auto RSP = static_cast<uintptr_t>(ExceptionInfo->ContextRecord->Rsp);
+			HANDLE  hSection = reinterpret_cast<HANDLE>(ExceptionInfo->ContextRecord->Rcx);
+			HANDLE     hProcess = reinterpret_cast<HANDLE>(ExceptionInfo->ContextRecord->Rdx);
+			PVOID* BaseAddress = reinterpret_cast<PVOID*>(ExceptionInfo->ContextRecord->R8);
+			PULONG AllocationType = reinterpret_cast<PULONG>(RSP + 9 * 8);
+			PULONG Protection = reinterpret_cast<PULONG>(RSP + 10 * 8);
+			PSIZE_T ViewSize = *reinterpret_cast<PSIZE_T*>(RSP + 7 * 8);
+#else
+			auto RSP = static_cast<uintptr_t>(ExceptionInfo->ContextRecord->Esp);
+			HANDLE  hSection = *reinterpret_cast<PHANDLE>(RSP + 4 * 1);
+			HANDLE     hProcess = *reinterpret_cast<PHANDLE>(RSP + 4 * 2);
+			PVOID* BaseAddress = *reinterpret_cast<PVOID**>(RSP + 4 * 3);
+			PULONG AllocationType = reinterpret_cast<PULONG>(RSP + 9 * 4);
+			PULONG Protection = reinterpret_cast<PULONG>(RSP + 10 * 4);
+			PSIZE_T ViewSize = *reinterpret_cast<PSIZE_T*>(RSP + 7 * 4);
+#endif
+			if (hSection != gLoaderData.hSection) {
+#ifdef _DEBUG
+				cout << " " << endl;
+				cout << "  " << hSection << endl;
+				cout << " " << gLoaderData.hSection << endl;
+#endif
+				NtContinue(ExceptionInfo->ContextRecord, FALSE);
+			}
+			if (hProcess != NtCurrentProcess()) {
+#ifdef _DEBUG
+				cout << " " << endl;
+				cout << " " << hProcess << endl;
+#endif
+				NtContinue(ExceptionInfo->ContextRecord, FALSE);
+			}
+#ifdef _DEBUG
+			cout << " " << endl;
+#endif
+			*AllocationType = 0; 
+			*Protection = PAGE_EXECUTE_READWRITE; 
+			*BaseAddress = gLoaderData.DllBase;
+			*ViewSize = gLoaderData.SizeOfImage;
+
+			size_t ret = 0;
+#ifdef _WIN64
+			PBYTE func_base = reinterpret_cast<PBYTE>(ExceptionInfo->ContextRecord->Rip);
+#else
+			PBYTE func_base = reinterpret_cast<PBYTE>(ExceptionInfo->ContextRecord->Eip);
+#endif
+			while (*func_base != RET_INSTRUCTION) {
+				func_base++;
+				ret++;
+			} 
+#ifdef _WIN64
+			ExceptionInfo->ContextRecord->Rax = 0;
+			ExceptionInfo->ContextRecord->Rip += ret;
+#else
+			ExceptionInfo->ContextRecord->Eax = 0;
+			ExceptionInfo->ContextRecord->Eip += ret;
+#endif
+
+			gLoaderData.state = LdrState::NtClose;
+			setupBreakpointVeh(reinterpret_cast<uintptr_t>(&NtClose), ExceptionInfo->ContextRecord);
+			NtContinue(ExceptionInfo->ContextRecord, FALSE);
+		}
+		if (gLoaderData.state == LdrState::NtClose) {
+#ifdef _DEBUG
+			cout << " " << endl;
+#endif
+
+#ifdef _WIN64
+			HANDLE handle = reinterpret_cast<HANDLE>(ExceptionInfo->ContextRecord->Rcx);
+#else
+			HANDLE handle = *reinterpret_cast<PHANDLE>(ExceptionInfo->ContextRecord->Esp + 4 * 1);
+#endif
+
+			if (handle == gLoaderData.hSection) {
+#ifdef _DEBUG
+				cout << " " << endl;
+				cout << " " << handle << endl;
+#endif
+				gLoaderData.state = LdrState::End;
+				NtContinue(ExceptionInfo->ContextRecord, FALSE);
+			}
+			else {
+#ifdef _DEBUG
+				cout << " " << endl;
+				cout << "  " << handle << endl;
+#endif
+				ExceptionInfo->ContextRecord->EFlags |= 0x10000;
+				NtContinue(ExceptionInfo->ContextRecord, FALSE);
+			}
+		}
+		if (gLoaderData.state == LdrState::End) {
+#ifdef _DEBUG
+			cout << " " << endl;
+#endif
+			ExceptionInfo->ContextRecord->Dr0 = 0;
+			ExceptionInfo->ContextRecord->Dr1 = 0;
+			ExceptionInfo->ContextRecord->Dr2 = 0;
+			ExceptionInfo->ContextRecord->Dr3 = 0;
+			ExceptionInfo->ContextRecord->Dr6 = 0;
+			ExceptionInfo->ContextRecord->Dr7 = 0;
+			ExceptionInfo->ContextRecord->EFlags |= 0x10000;
+			NtContinue(ExceptionInfo->ContextRecord, FALSE);
+		}
+		NtContinue(ExceptionInfo->ContextRecord, FALSE);
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+byte_array loader::readFileFull(const Path& filePath) {
+	byte_array buffer;
+	if (!fs::exists(filePath)) {
+#ifdef _DEBUG
+		cout << " '" << filePath.string() << " " << endl;
+#endif
+		return buffer;
+	}
+	std::ifstream file(filePath, std::ios::binary);
+	if (!file.is_open()) {
+#ifdef _DEBUG
+		cout << " " << filePath.string() << "" << endl;
+#endif
+		return buffer;
+	}
+	file.unsetf(std::ios::skipws);
+	file.seekg(0, std::ios::end);
+	buffer.reserve(static_cast<const size_t>(file.tellg()));
+	file.seekg(0, std::ios::beg);
+	buffer.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+	file.clear();
+	file.close();
+	return buffer;
+}
